@@ -331,6 +331,10 @@ def process_row(row):
     file_content = row['file_content']
     file_extension = os.path.splitext(file_name)[1]
     
+    # Ensure file_content is bytes
+    if isinstance(file_content, str):
+        file_content = file_content.encode('utf-8')
+    
     # Extract text from the file based on its type
     extracted_text = process_file(file_content, file_extension)
     
@@ -403,6 +407,16 @@ def process_files(input_file, output_file, max_workers=10):
     # Ensure the required columns exist
     if not {'file_name', 'file_content'}.issubset(df.columns):
         raise ValueError("Input CSV must contain 'file_name' and 'file_content' columns.")
+        
+    # If the file_content is stored as a string in the CSV, we need to convert it back to bytes
+    if isinstance(df['file_content'].iloc[0], str):
+        try:
+            # If it's stored as a base64 string
+            import base64
+            df['file_content'] = df['file_content'].apply(lambda x: base64.b64decode(x) if isinstance(x, str) else x)
+        except:
+            # If it's just a regular string
+            df['file_content'] = df['file_content'].apply(lambda x: x.encode('utf-8') if isinstance(x, str) else x)
     
     # Placeholder for normalized data
     normalized_data = []
@@ -442,7 +456,11 @@ def streamlit_app():
         data = []
         
         for file in uploaded_files:
+            # Read as bytes
             file_content = file.read()
+            # Ensure we're dealing with bytes
+            if not isinstance(file_content, bytes):
+                file_content = file_content.encode('utf-8')
             data.append({"file_name": file.name, "file_content": file_content})
         
         temp_df = pd.DataFrame(data)
