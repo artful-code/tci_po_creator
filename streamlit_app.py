@@ -3,10 +3,6 @@ import json
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
-import pdfplumber
-import fitz  # PyMuPDF
-import pytesseract
-from pdf2image import convert_from_path
 import docx
 import openpyxl
 import email
@@ -14,6 +10,12 @@ import os
 import re
 import tempfile
 from io import BytesIO
+import base64
+import sys
+
+# Import the PDF processing function from markdown.py
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from markdown import process_pdf
 
 # Initialize OpenAI client
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -46,134 +48,6 @@ Return ONLY the JSON object with the required fields.
 
 Here's the document content:
 """
-
-# Function to extract text from PDF (using the provided code)
-def process_pdf(file_content):
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-        temp_file.write(file_content)
-        temp_path = temp_file.name
-    
-    try:
-        # Using the existing PDF processing function
-        is_text_pdf = is_text_based_pdf(temp_path)
-
-        if is_text_pdf:
-            invoice_data = extract_key_value_pairs(temp_path)
-            structured_text = extract_text_with_structure(temp_path)
-            tables = extract_table_from_pdf(temp_path)
-        else:
-            structured_text = ocr_pdf(temp_path)
-            invoice_data = extract_key_value_pairs(temp_path)
-            tables = []
-
-        image_positions = extract_images(temp_path)
-        markdown_text = generate_markdown(invoice_data, structured_text, tables, image_positions)
-        
-        return markdown_text
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_path)
-
-# Function to check if PDF is text-based
-def is_text_based_pdf(pdf_path):
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text and len(text.strip()) > 50:
-                return True
-    return False
-
-# Function to extract structured text from PDF
-def extract_text_with_structure(pdf_path):
-    structured_text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            text = page.extract_text()
-            if text:
-                structured_text += f"\n\n### Page {page_num}: Text Section\n"
-                structured_text += text + "\n"
-    return structured_text
-
-# Function to extract tables from PDF
-def extract_table_from_pdf(pdf_path):
-    tables = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if table:
-                tables.append(table)
-    return tables
-
-# Function to extract key-value pairs from PDF
-def extract_key_value_pairs(pdf_path):
-    key_values = {}
-    doc = fitz.open(pdf_path)
-    for page in doc:
-        text_blocks = page.get_text("blocks")
-        for block in text_blocks:
-            text = block[4]  # Extracted text
-            if ":" in text:  # Key-value pair format
-                parts = text.split(":")
-                if len(parts) == 2:
-                    key, value = parts[0].strip(), parts[1].strip()
-                    key_values[key] = value
-    return key_values
-
-# Function to OCR scanned PDFs
-def ocr_pdf(pdf_path):
-    images = convert_from_path(pdf_path)
-    extracted_text = ""
-    for image in images:
-        text = pytesseract.image_to_string(image, config="--psm 6")
-        extracted_text += text + "\n"
-    return extracted_text
-
-# Function to extract images from PDF
-def extract_images(pdf_path):
-    doc = fitz.open(pdf_path)
-    image_positions = []
-    for page_num, page in enumerate(doc, 1):
-        images = page.get_images(full=True)
-        for img_index, img in enumerate(images, 1):
-            image_positions.append(f"Page {page_num}: Image {img_index} at (x={img[2]}, y={img[3]})")
-    return image_positions
-
-# Function to generate markdown from extracted PDF data
-def generate_markdown(invoice_data, structured_text, tables, image_positions):
-    markdown_text = "## Document data\n\n"
-
-    # Invoice Details (Key-Value Pairs)
-    markdown_text += "### Details\n"
-    for key, value in invoice_data.items():
-        markdown_text += f"- **{key}**: {value}\n"
-
-    # Extracted Text Sections
-    if structured_text:
-        markdown_text += "\n### Extracted Text Sections\n"
-        markdown_text += structured_text + "\n"
-
-    # Table Sections
-    if tables:
-        markdown_text += "\n### Extracted Tables\n"
-        for table in tables:
-            if not table or not table[0]:
-                continue
-
-            headers = [str(h) if h else "Unknown" for h in table[0]]
-            markdown_text += "| " + " | ".join(headers) + " |\n"
-            markdown_text += "| " + " | ".join(["-" * len(h) for h in headers]) + " |\n"
-
-            for row in table[1:]:
-                row = [str(cell) if cell else "N/A" for cell in row]
-                markdown_text += "| " + " | ".join(row) + " |\n"
-
-    # Embedded Images
-    if image_positions:
-        markdown_text += "\n### Detected Embedded Images\n"
-        for image in image_positions:
-            markdown_text += f"- {image}\n"
-
-    return markdown_text
 
 # Function to extract text from DOCX files
 def process_docx(file_content):
@@ -211,13 +85,17 @@ def process_docx(file_content):
     finally:
         os.unlink(temp_path)
 
-# Function to extract text from Excel files
+# Function to extract text from Excel files with improved debugging
 def process_xlsx(file_content):
     markdown_text = "## Document data\n\n"
     
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_file:
+        temp_file.write(file_content)
+        temp_path = temp_file.name
+    
     try:
-        # Load the workbook from bytes
-        workbook = openpyxl.load_workbook(BytesIO(file_content))
+        # Load the workbook from file
+        workbook = openpyxl.load_workbook(temp_path)
         
         # Process each worksheet
         for sheet_name in workbook.sheetnames:
@@ -225,10 +103,28 @@ def process_xlsx(file_content):
             markdown_text += f"\n### Sheet: {sheet_name}\n\n"
             
             # Find the used range
-            min_row, max_row = 1, sheet.max_row
-            min_col, max_col = 1, sheet.max_column
+            min_row, min_col = 1, 1
+            max_row = max(1, sheet.max_row)
+            max_col = max(1, sheet.max_column)
             
-            # Create a markdown table for the sheet data
+            # Debug info
+            markdown_text += f"*Sheet dimensions: {min_row}:{max_row} rows, {min_col}:{max_col} columns*\n\n"
+            
+            # Skip empty sheets
+            if max_row <= 1 and max_col <= 1 and not sheet.cell(1, 1).value:
+                markdown_text += "*Empty sheet*\n\n"
+                continue
+                
+            # Create header row for markdown table
+            header_row = []
+            for col in range(min_col, max_col + 1):
+                col_letter = openpyxl.utils.get_column_letter(col)
+                header_row.append(f"Col {col_letter}")
+            
+            markdown_text += "| " + " | ".join(header_row) + " |\n"
+            markdown_text += "| " + " | ".join(["---"] * len(header_row)) + " |\n"
+            
+            # Add data rows
             for row in range(min_row, max_row + 1):
                 row_data = []
                 for col in range(min_col, max_col + 1):
@@ -236,14 +132,12 @@ def process_xlsx(file_content):
                     row_data.append(str(cell_value) if cell_value is not None else "")
                 
                 markdown_text += "| " + " | ".join(row_data) + " |\n"
-                
-                # Add separator after header (first row)
-                if row == min_row:
-                    markdown_text += "| " + " | ".join(["---"] * len(row_data)) + " |\n"
         
         return markdown_text
     except Exception as e:
-        return f"## Error processing Excel file\n\nError: {str(e)}"
+        return f"## Error processing Excel file\n\nError: {str(e)}\n\nPlease ensure the file is a valid Excel file."
+    finally:
+        os.unlink(temp_path)
 
 # Function to extract text from email (.eml) files
 def process_eml(file_content):
@@ -314,16 +208,26 @@ def process_eml(file_content):
 
 # Function to process a file based on its type
 def process_file(file_content, file_extension):
-    if file_extension.lower() == '.pdf':
-        return process_pdf(file_content)
-    elif file_extension.lower() == '.docx':
-        return process_docx(file_content)
-    elif file_extension.lower() == '.xlsx':
-        return process_xlsx(file_content)
-    elif file_extension.lower() == '.eml':
-        return process_eml(file_content)
-    else:
-        return f"Unsupported file type: {file_extension}"
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+        temp_file.write(file_content)
+        temp_path = temp_file.name
+    
+    try:
+        if file_extension.lower() == '.pdf':
+            # Use the imported process_pdf function from markdown.py
+            return process_pdf(temp_path)
+        elif file_extension.lower() == '.docx':
+            return process_docx(file_content)
+        elif file_extension.lower() in ['.xlsx', '.xls']:
+            return process_xlsx(file_content)
+        elif file_extension.lower() == '.eml':
+            return process_eml(file_content)
+        else:
+            return f"Unsupported file type: {file_extension}"
+    finally:
+        # Clean up the temporary file
+        os.unlink(temp_path)
 
 # Function to process a row from the dataframe
 def process_row(row):
@@ -333,7 +237,12 @@ def process_row(row):
     
     # Ensure file_content is bytes
     if isinstance(file_content, str):
-        file_content = file_content.encode('utf-8')
+        try:
+            # Try to decode if it's base64 encoded
+            file_content = base64.b64decode(file_content)
+        except:
+            # Otherwise just encode the string
+            file_content = file_content.encode('utf-8')
     
     # Extract text from the file based on its type
     extracted_text = process_file(file_content, file_extension)
@@ -412,7 +321,6 @@ def process_files(input_file, output_file, max_workers=10):
     if isinstance(df['file_content'].iloc[0], str):
         try:
             # If it's stored as a base64 string
-            import base64
             df['file_content'] = df['file_content'].apply(lambda x: base64.b64decode(x) if isinstance(x, str) else x)
         except:
             # If it's just a regular string
@@ -449,7 +357,7 @@ def streamlit_app():
     st.write("Upload transportation order files (.pdf, .docx, .xlsx, .eml) to extract structured data")
     
     uploaded_files = st.file_uploader("Choose files", accept_multiple_files=True, 
-                                     type=["pdf", "docx", "xlsx", "eml"])
+                                     type=["pdf", "docx", "xlsx", "xls", "eml"])
     
     if uploaded_files and st.button("Process Files"):
         # Create temporary dataframe to store files
@@ -468,6 +376,9 @@ def streamlit_app():
         # Save temporary CSV
         temp_input = "temp_input.csv"
         temp_output = "temp_output.csv"
+        
+        # Save file_content as base64 to ensure proper storage in CSV
+        temp_df['file_content'] = temp_df['file_content'].apply(lambda x: base64.b64encode(x).decode('utf-8'))
         temp_df.to_csv(temp_input, index=False)
         
         with st.spinner("Processing files..."):
