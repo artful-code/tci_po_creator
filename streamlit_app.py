@@ -20,11 +20,13 @@ from markdown import process_pdf
 # Initialize OpenAI client
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# System prompt for accurate extraction
+# Modified System prompt for extracting multiple transportation orders
 SYSTEM_PROMPT = """
 You are an expert data extraction system specialized in analyzing transportation and logistics documents. Your task is to carefully extract information from purchase orders, invoices, and transport documents.
 
-Extract the following fields EXACTLY as they appear in the document or as close as possible:
+IMPORTANT: A single document may contain MULTIPLE transportation orders or trips. You must identify and extract ALL separate transportation orders in the document and return them as an ARRAY of JSON objects.
+
+For each transportation order, extract the following fields EXACTLY as they appear in the document or as close as possible:
 - FROM_LOCATION: The origin location of transportation
 - TO_LOCATION: The destination location
 - MATERIAL_TYPE: Type of materials being transported (e.g., "Autoparts", "Steel", "Electronics")
@@ -37,14 +39,77 @@ Extract the following fields EXACTLY as they appear in the document or as close 
 - END_DATE: Contract end date in YYYY-MM-DD format
 
 For any field not found in the document, use null. Analyze the entire document carefully, looking for these fields in headers, tables, key-value pairs, and body text.
-Return ONLY a valid JSON object with these fields and nothing else.
+
+Look carefully for cases where:
+1. The document contains multiple FROM_LOCATION and TO_LOCATION pairs
+2. Same FROM_LOCATION and TO_LOCATION but with different MATERIAL_TYPE or BODY_TYPE
+3. Tables with rows representing different transportation orders
+
+Return ONLY a valid JSON array of objects with these fields and nothing else.
+Each object in the array represents a separate transportation order.
+
+Your output must strictly follow this JSON structure:
+[
+  {
+    "FROM_LOCATION": "Location1",
+    "TO_LOCATION": "Location2",
+    "MATERIAL_TYPE": "MaterialType1",
+    "BODY_TYPE": "BodyType1",
+    "FREQUENCY": "Frequency1",
+    "WEIGHT": "Weight1",
+    "RATE_UOM": "RateUOM1",
+    "TRIPS_IN_MONTH": "TripsPerMonth1",
+    "START_DATE": "StartDate1",
+    "END_DATE": "EndDate1"
+  },
+  {
+    "FROM_LOCATION": "Location3",
+    "TO_LOCATION": "Location4",
+    "MATERIAL_TYPE": "MaterialType2",
+    "BODY_TYPE": "BodyType2",
+    "FREQUENCY": "Frequency2",
+    "WEIGHT": "Weight2",
+    "RATE_UOM": "RateUOM2",
+    "TRIPS_IN_MONTH": "TripsPerMonth2",
+    "START_DATE": "StartDate2",
+    "END_DATE": "EndDate2"
+  }
+]
+
+If you only find one transportation order, still return it as an array with one object.
 """
 
-# User prompt template
+# Modified User prompt template
 USER_PROMPT_TEMPLATE = """
-Extract the transportation order details from the following document text. 
-The document contains details about shipping/transportation orders.
-Return ONLY the JSON object with the required fields.
+Extract ALL transportation order details from the following document text. 
+The document may contain multiple transportation orders/trips.
+Return ONLY a JSON array following this exact structure:
+[
+  {
+    "FROM_LOCATION": "Ambattur",
+    "TO_LOCATION": "Hyderabad",
+    "MATERIAL_TYPE": "Autoparts",
+    "BODY_TYPE": "20FT Container",
+    "FREQUENCY": "10",
+    "WEIGHT": "200 T",
+    "RATE_UOM": "Per KG",
+    "TRIPS_IN_MONTH": "4",
+    "START_DATE": "2019-11-06",
+    "END_DATE": "2022-11-06"
+  },
+  {
+    "FROM_LOCATION": "Location2",
+    "TO_LOCATION": "Location2",
+    "MATERIAL_TYPE": "Material2",
+    "BODY_TYPE": "Container2",
+    "FREQUENCY": "Frequency2",
+    "WEIGHT": "Weight2",
+    "RATE_UOM": "RateUOM2",
+    "TRIPS_IN_MONTH": "Trips2",
+    "START_DATE": "StartDate2",
+    "END_DATE": "EndDate2"
+  }
+]
 
 Here's the document content:
 """
@@ -229,7 +294,7 @@ def process_file(file_content, file_extension):
         # Clean up the temporary file
         os.unlink(temp_path)
 
-# Function to process a row from the dataframe
+# Modified function to process a row from the dataframe
 def process_row(row):
     file_name = row['file_name']
     file_content = row['file_content']
@@ -258,11 +323,12 @@ def process_row(row):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,  # Lower temperature for more consistent extraction
-            max_tokens=1000,
+            temperature=0.2,  # Even lower temperature for more consistent extraction
+            max_tokens=2000,  # Further increased token limit to handle multiple orders
             top_p=1,
             frequency_penalty=0,
-            presence_penalty=0
+            presence_penalty=0,
+            response_format={"type": "json_object"}  # Force JSON format response
         )
         
         # Extract the content from the response
@@ -276,26 +342,58 @@ def process_row(row):
         
         # Parse the cleaned content into JSON
         content = content.strip()
-        response_json = json.loads(content)
         
-        # Ensure all required fields are present
+        try:
+            # First try parsing the content directly
+            response_json = json.loads(content)
+        except json.JSONDecodeError:
+            # If parsing fails, try extracting the JSON array from the text
+            # This handles cases where the model might add additional text
+            json_pattern = r'\[\s*{[\s\S]*}\s*\]'
+            json_match = re.search(json_pattern, content)
+            
+            if json_match:
+                json_str = json_match.group(0)
+                response_json = json.loads(json_str)
+            else:
+                # If all else fails, create an empty list
+                print(f"Failed to parse JSON from response: {content[:100]}...")
+                response_json = []
+        
+        # Ensure response is a list/array
+        if not isinstance(response_json, list):
+            response_json = [response_json]  # Convert to list if single object
+        
+        # Required fields
         required_fields = [
             "FROM_LOCATION", "TO_LOCATION", "MATERIAL_TYPE", "BODY_TYPE", 
             "FREQUENCY", "WEIGHT", "RATE_UOM", "TRIPS_IN_MONTH", 
             "START_DATE", "END_DATE"
         ]
         
-        for field in required_fields:
-            if field not in response_json:
-                response_json[field] = None
+        # Create list to hold normalized data for each transportation order
+        all_normalized = []
         
-        # Normalize the JSON into tabular format
-        normalized = pd.json_normalize(response_json)
+        # Process each transportation order
+        for order_json in response_json:
+            # Ensure all required fields are present
+            for field in required_fields:
+                if field not in order_json:
+                    order_json[field] = None
+            
+            # Normalize the JSON into tabular format
+            normalized = pd.json_normalize(order_json)
+            
+            # Add the file name for reference
+            normalized["file_name"] = file_name
+            
+            all_normalized.append(normalized)
         
-        # Add the file name for reference
-        normalized["file_name"] = file_name
-        
-        return normalized
+        # Combine all orders from this file
+        if all_normalized:
+            return pd.concat(all_normalized, ignore_index=True)
+        else:
+            return None
     
     except Exception as e:
         print(f"Error processing file {file_name}: {e}")
